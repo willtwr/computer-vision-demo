@@ -34,10 +34,6 @@ class TensorRTInference:
             size = trt.volume(engine.get_tensor_shape(tensor_name))
             dtype = trt.nptype(engine.get_tensor_dtype(tensor_name))
 
-            print(tensor_name)
-            print(size)
-            print(dtype)
-
             # Allocate host and device buffers
             host_mem = cuda.pagelocked_empty(size, dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
