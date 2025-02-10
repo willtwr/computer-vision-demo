@@ -2,7 +2,7 @@ import json
 import numpy as np
 import cv2
 import torch
-from tensorrtinference import TensorRTInference
+from obj_det.tensorrt_inference import TensorRTInference
 from transformers import RTDetrImageProcessor
 from PIL import ImageDraw, Image
 from dataclasses import dataclass

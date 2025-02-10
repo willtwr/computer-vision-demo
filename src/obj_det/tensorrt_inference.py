@@ -2,6 +2,7 @@ import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
+from models.cuda_model import HostDeviceMem
 
 
 class TensorRTInference:
@@ -18,11 +19,6 @@ class TensorRTInference:
         with open(engine_path, "rb") as f:
             engine = self.runtime.deserialize_cuda_engine(f.read())
         return engine
-
-    class HostDeviceMem:
-        def __init__(self, host_mem, device_mem):
-            self.host = host_mem
-            self.device = device_mem
 
     def allocate_buffers(self, engine):
         inputs, outputs, bindings = [], [], []
@@ -43,19 +39,14 @@ class TensorRTInference:
 
             # Append to the appropiate input/output list
             if engine.get_tensor_mode(tensor_name) == trt.TensorIOMode.INPUT:
-                inputs.append(self.HostDeviceMem(host_mem, device_mem))
+                inputs.append(HostDeviceMem(host_mem, device_mem))
             else:
-                outputs.append(self.HostDeviceMem(host_mem, device_mem))
+                outputs.append(HostDeviceMem(host_mem, device_mem))
 
         return inputs, outputs, bindings, stream
 
     def infer(self, input_data):
-        # torch.cuda.empty_cache()
-
         # Transfer input data to device
-        # np.copyto(self.inputs[0].host, input_data.ravel())
-        # cuda.memcpy_htod_async(self.inputs[0].device, self.inputs[0].host, self.stream)
-
         self.inputs[0].host = np.ascontiguousarray(input_data, dtype=np.float32)
         [cuda.memcpy_htod_async(inp.device, inp.host, self.stream) for inp in self.inputs]
 
