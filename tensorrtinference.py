@@ -1,85 +1,76 @@
-from collections import namedtuple, OrderedDict
-
-import torch
 import numpy as np
 import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
 
 
 class TensorRTInference:
-    def __init__(self, engine_path, device='cuda:0', max_batch_size=32):
-        self.logger = trt.Logger(trt.Logger.VERBOSE)
-        self.device = device
+    def __init__(self, engine_path):
+        self.logger = trt.Logger(trt.Logger.ERROR)
+        self.runtime = trt.Runtime(self.logger)
         self.engine = self.load_engine(engine_path)
         self.context = self.engine.create_execution_context()
 
-        self.bindings = self.get_bindings(self.engine, self.context, max_batch_size, device)
-        self.bindings_addr = OrderedDict((n, v.ptr) for n, v in self.bindings.items())
-
-        self.input_names = self.get_input_names()
-        self.output_names = self.get_output_names()
-
-        print(self.bindings)
-        print(self.input_names)
-        print(self.output_names)
+        # Allocate buffers
+        self.inputs, self.outputs, self.bindings, self.stream = self.allocate_buffers(self.engine)
 
     def load_engine(self, engine_path):
-        trt.init_libnvinfer_plugins(self.logger, '')
-        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
-            engine = runtime.deserialize_cuda_engine(f.read())
-
+        with open(engine_path, "rb") as f:
+            engine = self.runtime.deserialize_cuda_engine(f.read())
         return engine
 
-    def get_input_names(self, ):
-        names = []
-        for _, name in enumerate(self.engine):
-            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                names.append(name)
+    class HostDeviceMem:
+        def __init__(self, host_mem, device_mem):
+            self.host = host_mem
+            self.device = device_mem
 
-        return names
-    
-    def get_output_names(self, ):
-        names = []
-        for _, name in enumerate(self.engine):
-            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
-                names.append(name)
+    def allocate_buffers(self, engine):
+        inputs, outputs, bindings = [], [], []
+        stream = cuda.Stream()
 
-        return names
-        
-    def get_bindings(self, engine, context, max_batch_size=32, device=None):
-        '''build binddings
-        '''
-        Binding = namedtuple('Binding', ('name', 'dtype', 'shape', 'data', 'ptr'))
-        bindings = OrderedDict()
+        for i in range(engine.num_io_tensors):
+            # tensor_name = engine.get_tensor_name()
+            tensor_name = engine.get_tensor_name(i)
+            size = trt.volume(engine.get_tensor_shape(tensor_name))
+            dtype = trt.nptype(engine.get_tensor_dtype(tensor_name))
 
-        for i, name in enumerate(engine):
-            shape = engine.get_tensor_shape(name)
-            dtype = trt.nptype(engine.get_tensor_dtype(name))
+            # Allocate host and device buffers
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
 
-            if shape[0] == -1:
-                dynamic = True 
-                shape[0] = max_batch_size
-                if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:  # dynamic
-                    context.set_input_shape(name, shape)
+            # Append the device buffer address to device bindings
+            bindings.append(int(device_mem))
 
-            data = torch.from_numpy(np.empty(shape, dtype=dtype)).to(device)
-            bindings[name] = Binding(name, dtype, shape, data, data.data_ptr())
+            # Append to the appropiate input/output list
+            if engine.get_tensor_mode(tensor_name) == trt.TensorIOMode.INPUT:
+                inputs.append(self.HostDeviceMem(host_mem, device_mem))
+            else:
+                outputs.append(self.HostDeviceMem(host_mem, device_mem))
 
-        return bindings
-    
-    def run_torch(self, blob):
-        '''torch input
-        '''
-        for n in self.input_names:
-            if self.bindings[n].shape != blob[n].shape:
-                self.context.set_input_shape(n, blob[n].shape) 
-                self.bindings[n] = self.bindings[n]._replace(shape=blob[n].shape)
+        return inputs, outputs, bindings, stream
 
-        self.bindings_addr.update({n: blob[n].data_ptr() for n in self.input_names})
-        self.context.execute_v2(list(self.bindings_addr.values()))
-        outputs = {n: self.bindings[n].data for n in self.output_names}
+    def infer(self, input_data):
+        # torch.cuda.empty_cache()
 
-        return outputs
-    
-    def __call__(self, blob):
-        blob = {"images": torch.from_numpy(blob).to(self.device)}
-        return self.run_torch(blob)
+        # Transfer input data to device
+        # np.copyto(self.inputs[0].host, input_data.ravel())
+        # cuda.memcpy_htod_async(self.inputs[0].device, self.inputs[0].host, self.stream)
+
+        self.inputs[0].host = np.ascontiguousarray(input_data, dtype=np.float32)
+        [cuda.memcpy_htod_async(inp.device, inp.host, self.stream) for inp in self.inputs]
+
+        # Set tensor address
+        for i in range(self.engine.num_io_tensors):
+            self.context.set_tensor_address(self.engine.get_tensor_name(i), self.bindings[i])
+
+        # Run inference
+        self.context.execute_async_v3(stream_handle=self.stream.handle)
+
+        # Transfer predictions back
+        # cuda.memcpy_dtoh_async(self.outputs[0].host, self.outputs[0].device, self.stream)
+        [cuda.memcpy_dtoh_async(out.host, out.device, self.stream) for out in self.outputs]
+
+        # Synchronize the stream
+        self.stream.synchronize()
+
+        return self.outputs
